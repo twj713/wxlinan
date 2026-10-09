@@ -187,6 +187,24 @@ async function handle(ws: WebSocket, msg: any, setId: (id: string) => void) {
     await kv.set(["requests", myId], reqs.filter((r: any) => r.fromId !== fromId));
     send(ws, {type: "friendAdded", friendId: fromId});
     send(online.get(fromId), {type: "friendAdded", friendId: myId});
+    // 添加成功后，申请方自动向新好友发送一条问候语（写入会话并广播双方，离线也能在点开会话时看到）
+    const fromUser = (await kv.get(["users", fromId])).value;
+    const greetText = "你好，我是" + (fromUser && fromUser.nick ? String(fromUser.nick) : "新朋友") + "，很高兴认识你！";
+    const gChatId = chatIdOf(fromId, myId);
+    const greet: any = {
+      id: "greet_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8),
+      from: fromId,
+      content: greetText,
+      mode: "normal",
+      time: Date.now(),
+    };
+    const glist = (await kv.get(["messages", gChatId])).value || [];
+    if (!glist.find((m: any) => m.id === greet.id)) {
+      glist.push(greet);
+      if (glist.length > MSG_LIMIT) glist.splice(0, glist.length - MSG_LIMIT);
+      await kv.set(["messages", gChatId], glist);
+    }
+    [fromId, myId].forEach((rid) => send(online.get(rid), {type: "newMessage", chatId: gChatId, entry: greet}));
     return;
   }
 
