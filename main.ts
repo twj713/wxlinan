@@ -257,7 +257,7 @@ async function handle(ws: WebSocket, msg: any, setId: (id: string) => void) {
       chatId = chatIdOf(from, to);
       recipients = [from, to];
     }
-    const entry = {from, content, mode, time: Date.now()};
+    const entry = {from, content, mode, time: Number(msg.time) || Date.now()};
     const list = (await kv.get(["messages", chatId])).value || [];
     list.push(entry);
     if (list.length > 500) list.splice(0, list.length - 500);
