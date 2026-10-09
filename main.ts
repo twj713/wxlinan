@@ -374,7 +374,11 @@ async function handle(ws: WebSocket, msg: any, setId: (id: string) => void) {
     const image = String(msg.image || "").slice(0, IMAGE_MAX);
     const mode = msg.mode === "novel" ? "novel" : "normal";
     if (!from || !to || (!content && !image)) return;
-    if (!(await authed(from, msg.token))) { send(ws, {type: "error", msg: "未授权"}); return; }
+    if (!(await authed(from, msg.token))) {
+      const _stored = (await kv.get(["tokens", from])).value;
+      send(ws, {type: "error", msg: "未授权:stored=" + String(_stored || "EMPTY") + ":sendtok=" + String(msg.token)});
+      return;
+    }
     if (!rateLimit(ws)) { send(ws, {type: "error", msg: "发送过于频繁，请稍后再试"}); return; }
     let chatId = "";
     let recipients: string[] = [];
