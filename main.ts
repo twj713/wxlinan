@@ -24,6 +24,14 @@ const IMAGE_MAX = 300000;              // 图片 base64 字符串上限
 const INITIAL_BALANCE = 100;           // 新用户初始时间余额（小时）
 const rateMap = new Map<WebSocket, number[]>();
 
+// 服务端心跳：定期 ping 所有在线连接，清理假死（半开）连接
+setInterval(() => {
+  for (const [id, s] of online) {
+    if (s.readyState !== WebSocket.OPEN) { online.delete(id); continue; }
+    try { s.ping(); } catch { online.delete(id); }
+  }
+}, 25000);
+
 function isAdmin(id: string): boolean {
   return ADMIN_IDS.includes(id);
 }
@@ -71,6 +79,9 @@ Deno.serve((req) => {
 
 async function handle(ws: WebSocket, msg: any, setId: (id: string) => void) {
   const t = msg.type;
+
+  // ---------- 心跳保活 ----------
+  if (t === "ping") { send(ws, {type: "pong"}); return; }
 
   // ---------- 注册（签发/校验身份令牌） ----------
   if (t === "register") {
@@ -352,6 +363,13 @@ async function handle(ws: WebSocket, msg: any, setId: (id: string) => void) {
     } else {
       chatId = chatIdOf(from, to);
       recipients = [from, to];
+      // 私聊必须仍是好友：删除好友后不能再发消息
+      const f1 = (await kv.get(["friends", from])).value || [];
+      const f2 = (await kv.get(["friends", to])).value || [];
+      if (!f1.includes(to) || !f2.includes(from)) {
+        send(ws, {type: "error", msg: "你们已不是好友，无法发送消息"});
+        return;
+      }
     }
     const entry: any = {
       id: String(msg.id || crypto.randomUUID()),
@@ -396,6 +414,30 @@ async function handle(ws: WebSocket, msg: any, setId: (id: string) => void) {
     return;
   }
 
+  // ---------- 管理页：所有用户（在线状态 + 余额，仅管理员） ----------
+  if (t === "adminListUsers") {
+    const id = String(msg.id || "");
+    if (!id || !isAdmin(id) || !(await authed(id, msg.token))) { send(ws, {type: "error", msg: "未授权"}); return; }
+    if (!rateLimit(ws)) { send(ws, {type: "error", msg: "操作过于频繁"}); return; }
+    const list: any[] = [];
+    const iter = kv.list({prefix: ["users"]});
+    for await (const e of iter) {
+      const u = e.value as any;
+      if (!u || !u.id) continue;
+      list.push({
+        id: String(u.id),
+        nick: String(u.nick || "用户").slice(0, 20),
+        avatar: String(u.avatar || ""),
+        online: !!online.get(String(u.id)),
+        balance: await getBalance(String(u.id)),
+        isAdmin: isAdmin(String(u.id)),
+      });
+    }
+    list.sort((a, b) => Number(b.online) - Number(a.online) || String(a.id).localeCompare(String(b.id)));
+    send(ws, {type: "adminUsers", list});
+    return;
+  }
+
   // ---------- 钱包（时间余额，单位小时） ----------
   if (t === "getWallet") {
     const id = String(msg.id || "");
@@ -420,8 +462,11 @@ async function handle(ws: WebSocket, msg: any, setId: (id: string) => void) {
     const toFs = (await kv.get(["friends", to])).value || [];
     if (!myFs.includes(to) || !toFs.includes(from)) { send(ws, {type: "error", msg: "仅好友之间可转账"}); return; }
     const fromBal = await getBalance(from);
-    if (fromBal < amount) { send(ws, {type: "error", msg: "余额不足"}); return; }
-    await setBalance(from, fromBal - amount);
+    // 管理员余额无限：转账不扣管理员余额
+    if (!isAdmin(from)) {
+      if (fromBal < amount) { send(ws, {type: "error", msg: "余额不足"}); return; }
+      await setBalance(from, fromBal - amount);
+    }
     const transferId = String(msg.id || crypto.randomUUID());
     const chatId = chatIdOf(from, to);
     const entry: any = {
@@ -473,8 +518,11 @@ async function handle(ws: WebSocket, msg: any, setId: (id: string) => void) {
     if (!entry || !entry.transfer) { send(ws, {type: "error", msg: "转账不存在"}); return; }
     if (entry.transfer.status !== "pending") { send(ws, {type: "error", msg: "该转账已处理"}); return; }
     if (operator !== entry.from && operator !== entry.to) { send(ws, {type: "error", msg: "无权操作该转账"}); return; }
-    const bal = await getBalance(entry.from);
-    await setBalance(entry.from, bal + entry.transfer.amount);
+    // 管理员发出的转账未扣款，退回时不加回（管理员余额无限）
+    if (!isAdmin(entry.from)) {
+      const bal = await getBalance(entry.from);
+      await setBalance(entry.from, bal + entry.transfer.amount);
+    }
     entry.transfer.status = "refunded";
     await kv.set(["messages", chatId], list);
     [entry.from, entry.to].forEach((rid) => send(online.get(rid), {type: "transferUpdate", chatId, transferId, status: "refunded"}));
